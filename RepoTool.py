@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+RepoTool — генератор Markdown-документации проекта и восстановитель из .md
+Режимы:
+- Интерактивный (для Проводника): если передан единственный аргумент `%1` без флагов,
+  скрипт определяет режим по типу объекта и открывает стандартные окна выбора путей.
+  * Папка -> Генерация -> asksaveasfilename (куда сохранить .md)
+  * .md-файл -> Восстановление -> askdirectory (куда восстановить проект)
+- CLI (--mode/--path/--out/--zip-binaries): для автоматизации и CI.
+
+Зависимости: только стандартная библиотека Python.
+"""
 
 from __future__ import annotations
 import argparse
@@ -11,9 +22,18 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, List, Tuple, Dict, Optional
 
-# -------- Настройки по умолчанию --------
+# --- GUI для интерактива (стандартные диалоги Windows через tkinter) ---
+try:
+    # tkinter есть в стандартной поставке CPython для Windows
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except Exception:
+    tk = None
+    filedialog = None
+    messagebox = None
 
-# Расширения, считающиеся текстовыми (добавлены .tsx/.ts/.jsx/.vue и др.)
+# -------- Настройки --------
+
 TEXT_EXTS = {
     ".txt",".md",".rst",".markdown",
     ".py",".pyi",".toml",".ini",".cfg",".conf",".cnf",".yaml",".yml",
@@ -32,8 +52,6 @@ TEXT_EXTS = {
     ".sql",".dockerfile",".env",".dotenv",".makefile",".mk",".nuspec",
     ".tex",".bib",
 }
-
-# Игнор по умолчанию
 DEFAULT_IGNORES = {
     ".git", ".hg", ".svn",
     ".idea", ".vscode", ".vs",
@@ -43,47 +61,36 @@ DEFAULT_IGNORES = {
     ".DS_Store", "Thumbs.db",
     ".scannerwork", "coverage", "target", "out",
 }
-
-# Файл с дополнительными игнорами (gitignore-стиль, простые маски)
 IGNORE_FILE = ".repotoolignore"
-
-# Разделители в Markdown
 HR = "\n---\n"
 
 # -------- Утилиты --------
 
 def is_probably_text(path: Path) -> bool:
-    """Эвристика для бинарников: проверяем расширение и содержимое."""
     ext = path.suffix.lower()
     if ext in TEXT_EXTS or path.name.lower() in ("makefile", "dockerfile"):
         return True
     try:
         with open(path, "rb") as f:
             sample = f.read(2048)
-        # если есть NUL-байты — почти точно бинарь
         if b"\x00" in sample:
             return False
-        # допустим небольшой порог «нестандартных» байтов
         nontext = sum(1 for b in sample if b > 0x7F and b < 0xA0)
         return nontext / max(1, len(sample)) < 0.30
     except Exception:
-        # если не удалось прочитать — считаем бинарём, чтобы не ломать Markdown
         return False
 
 def read_text_best_effort(path: Path) -> str:
-    """Пытаемся прочитать файл в разных кодировках, затем с заменами."""
     encodings = ["utf-8", "utf-16", "cp1251"]
     for enc in encodings:
         try:
             return path.read_text(encoding=enc)
         except Exception:
             pass
-    # последняя попытка — «как есть», с заменами
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 def detect_language_tag(path: Path) -> str:
-    """Подбираем язык для подсветки в fenced-блоках по расширению."""
     ext = path.suffix.lower()
     mapping = {
         ".py":"python", ".js":"javascript", ".jsx":"jsx", ".ts":"typescript", ".tsx":"tsx",
@@ -96,7 +103,6 @@ def detect_language_tag(path: Path) -> str:
     return mapping.get(ext, "")
 
 def load_extra_ignores(root: Path) -> List[str]:
-    """Поддержка .repotoolignore (простые строки, # комменты, пустые — пропуск)."""
     path = root / IGNORE_FILE
     ignores: List[str] = []
     if path.exists():
@@ -109,19 +115,12 @@ def load_extra_ignores(root: Path) -> List[str]:
 
 def should_ignore(rel_path: Path, default_names: set[str], extra: List[str]) -> bool:
     parts = rel_path.parts
-    # каталоги и скрытые по умолчанию
     if any(p in default_names for p in parts):
         return True
     if any(p.startswith(".") and p not in (".", "..") for p in parts):
-        # скрытые папки/файлы (кроме «.»/«..»)
         return True
-    # простые подстрочные/масочные проверки из .repotoolignore
     s = str(rel_path).replace("\\", "/")
     for pat in extra:
-        # поддержим несколько простых форматов:
-        #  - суффикс "/*" => каталог с любым содержимым
-        #  - "*.ext" => маска по расширению
-        #  - просто подстрока
         if pat.endswith("/*"):
             base = pat[:-2]
             if s.startswith(base+"/") or s == base:
@@ -135,25 +134,12 @@ def should_ignore(rel_path: Path, default_names: set[str], extra: List[str]) -> 
     return False
 
 def build_tree(root: Path, files: List[Path]) -> str:
-    """Строим ASCII-дерево относительно root для списка файлов."""
-    # Сгруппируем по директориям
     from collections import defaultdict
     dirs: Dict[Path, List[Path]] = defaultdict(list)
     for f in files:
         dirs[f.parent].append(f)
 
-    # Соберём полный набор папок
-    all_dirs = set(p.parent for p in files)
-    cur = root
-    while cur != cur.parent:
-        cur = cur.parent  # подстраховка
-
-    def children(d: Path) -> Tuple[List[Path], List[Path]]:
-        subdirs = sorted({p for p in all_dirs if p.parent == d}, key=lambda p: p.name.lower())
-        leafs = sorted(dirs.get(d, []), key=lambda p: p.name.lower())
-        return (subdirs, leafs)
-
-    # Вычислим все иерархии от root
+    # Собираем множество всех директорий по пути к файлам
     all_dirs = set()
     for f in files:
         p = f.parent
@@ -162,6 +148,11 @@ def build_tree(root: Path, files: List[Path]) -> str:
             if p == root:
                 break
             p = p.parent
+
+    def children(d: Path) -> Tuple[List[Path], List[Path]]:
+        subdirs = sorted({p for p in all_dirs if p.parent == d}, key=lambda p: p.name.lower())
+        leafs = sorted(dirs.get(d, []), key=lambda p: p.name.lower())
+        return (subdirs, leafs)
 
     def walk(d: Path, prefix: str, lines: List[str]) -> None:
         subdirs, leafs = children(d)
@@ -177,8 +168,6 @@ def build_tree(root: Path, files: List[Path]) -> str:
     walk(root, "", lines)
     return "```text\n" + "\n".join(lines) + "\n```"
 
-# -------- Генерация --------
-
 def gather_files(root: Path) -> List[Path]:
     extra_ignores = load_extra_ignores(root)
     collected: List[Path] = []
@@ -192,10 +181,8 @@ def gather_files(root: Path) -> List[Path]:
     return collected
 
 def render_markdown(root: Path, files: List[Path], zip_binaries: bool) -> Tuple[str, Optional[bytes]]:
-    """Формируем Markdown и, при необходимости, zip с бинарниками."""
     lines: List[str] = []
-    lines.append(f"# Project: {root.name}")
-    lines.append("")
+    lines.append(f"# Project: {root.name}\n")
     lines.append("## Structure")
     lines.append(build_tree(root, files))
     lines.append(HR)
@@ -205,9 +192,7 @@ def render_markdown(root: Path, files: List[Path], zip_binaries: bool) -> Tuple[
         rel = path.relative_to(root)
         if is_probably_text(path):
             lang = detect_language_tag(path)
-            header = f"## File: {rel.as_posix()}"
-            lines.append(header)
-            lines.append("")
+            lines.append(f"## File: {rel.as_posix()}\n")
             lines.append(f"```{lang}".rstrip())
             try:
                 lines.append(read_text_best_effort(path))
@@ -220,39 +205,22 @@ def render_markdown(root: Path, files: List[Path], zip_binaries: bool) -> Tuple[
 
     zip_bytes = None
     if zip_binaries and binaries:
-        # упакуем бинарники в память, ассеты лежат по тем же относительным путям
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for b in binaries:
                 zf.write(b, arcname=b.relative_to(root).as_posix())
         zip_bytes = buf.getvalue()
-
-        # запишем раздел с описанием ассетов
-        lines.append("## Binary assets")
-        lines.append("")
+        lines.append("## Binary assets\n")
         lines.append("См. рядом лежащий архив `assets.zip` с нетекстовыми файлами проекта.")
         lines.append(HR)
 
     return "\n".join(lines).rstrip() + "\n", zip_bytes
-
-# -------- Восстановление --------
 
 FILE_SECTION_RE = re.compile(r"^##\s+File:\s+(.+)$", re.MULTILINE)
 FENCE_START_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*$")
 FENCE_END_RE = re.compile(r"^```\s*$")
 
 def restore_from_markdown(md_text: str, out_dir: Path) -> None:
-    """
-    Парсим секции вида:
-
-    ## File: path/to/file.ext
-
-    ```lang
-    <content>
-    ```
-
-    Всё остальное игнорируем (включая блок дерева).
-    """
     matches = list(FILE_SECTION_RE.finditer(md_text))
     for idx, m in enumerate(matches):
         rel = Path(m.group(1).strip())
@@ -260,7 +228,6 @@ def restore_from_markdown(md_text: str, out_dir: Path) -> None:
         end = matches[idx+1].start() if idx + 1 < len(matches) else len(md_text)
         section = md_text[start:end]
 
-        # найдём первый fenced-блок в секции
         lines = section.splitlines()
         content_lines: List[str] = []
         in_fence = False
@@ -276,44 +243,37 @@ def restore_from_markdown(md_text: str, out_dir: Path) -> None:
 
         target_path = out_dir / rel
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        # попытка записать в utf-8, если не выйдет — всё равно utf-8 с заменами
         try:
             target_path.write_text(content, encoding="utf-8")
         except Exception:
             with open(target_path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(content)
 
-# -------- CLI / интеграция --------
+# -------- CLI / интерактив --------
 
 def generate_mode(path: Path, out: Optional[Path], zip_binaries: bool) -> None:
     if not path.is_dir():
         raise SystemExit(f"Ожидалась папка проекта: {path}")
     files = gather_files(path)
     md, zip_bytes = render_markdown(path, files, zip_binaries=zip_binaries)
-
     if out is None:
-        # имя по умолчанию рядом с папкой
-        out = Path.cwd() / f"{path.name}_documentation.md"
+        raise SystemExit("Не указан --out в CLI-режиме генерации.")
     out.write_text(md, encoding="utf-8")
     if zip_bytes:
         (out.parent / "assets.zip").write_bytes(zip_bytes)
-    print(f"[OK] Документация создана: {out}")
 
 def restore_mode(md_path: Path, out_dir: Optional[Path]) -> None:
     if not md_path.is_file():
         raise SystemExit(f"Ожидался .md файл: {md_path}")
     md = md_path.read_text(encoding="utf-8", errors="ignore")
-    base_name = md_path.stem.replace("_documentation", "")
     if out_dir is None:
-        out_dir = md_path.parent / base_name
+        raise SystemExit("Не указан --out в CLI-режиме восстановления.")
     out_dir.mkdir(parents=True, exist_ok=True)
     restore_from_markdown(md, out_dir)
-    # если рядом assets.zip — распакуем
     assets = md_path.parent / "assets.zip"
     if assets.exists():
         with zipfile.ZipFile(assets, "r") as zf:
             zf.extractall(out_dir)
-    print(f"[OK] Проект восстановлен в: {out_dir}")
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -323,26 +283,122 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--mode", choices=["generate","restore"], help="Режим работы")
     p.add_argument("--path", help="Путь: папка проекта (generate) или .md файл (restore)")
     p.add_argument("--out", help="Выход: .md файл (generate) или папка (restore)")
-    p.add_argument("--zip-binaries", action="store_true", help="Упаковывать бинарники в assets.zip")
+    p.add_argument("--zip-binaries", action="store_true", help="Упаковывать бинарники в assets.zip (generate)")
     return p.parse_args(argv)
 
+# ---- Интерактивные диалоги (для вызова из Проводника) ----
+
+def run_interactive_with_folder(folder: Path) -> None:
+    """Папка -> Генерация; спрашиваем куда сохранить .md и нужен ли assets.zip."""
+    if tk is None or filedialog is None:
+        raise SystemExit("GUI недоступен (tkinter). Пересоберите Python с Tk.")
+    root = tk.Tk()
+    root.withdraw()
+
+    # чекбокса в стандартном диалоге нет — спросим через простое окно
+    zip_binaries = False
+    if messagebox.askyesno(
+        "RepoTool — генерация",
+        "Упаковать нетекстовые файлы (assets.zip) рядом с .md?\nДа — создать assets.zip\nНет — только .md"
+    ):
+        zip_binaries = True
+
+    initial_name = f"{folder.name}_documentation.md"
+    out_path = filedialog.asksaveasfilename(
+        title="Куда сохранить документацию (*.md)",
+        defaultextension=".md",
+        initialfile=initial_name,
+        filetypes=[("Markdown files","*.md"), ("All files","*.*")]
+    )
+    if not out_path:
+        return  # пользователь отменил
+
+    files = gather_files(folder)
+    md, zip_bytes = render_markdown(folder, files, zip_binaries=zip_binaries)
+
+    out_file = Path(out_path)
+    out_file.write_text(md, encoding="utf-8")
+    if zip_binaries and zip_bytes:
+        (out_file.parent / "assets.zip").write_bytes(zip_bytes)
+
+    messagebox.showinfo("RepoTool", f"Документация сохранена:\n{out_file}")
+
+def run_interactive_with_md(md_file: Path) -> None:
+    """MD-файл -> Восстановление; спрашиваем куда развернуть проект."""
+    if tk is None or filedialog is None:
+        raise SystemExit("GUI недоступен (tkinter). Пересоберите Python с Tk.")
+    root = tk.Tk()
+    root.withdraw()
+
+    base_out = filedialog.askdirectory(
+        title="Куда восстановить проект (выберите папку)"
+    )
+    if not base_out:
+        return  # пользователь отменил
+
+    md_text = md_file.read_text(encoding="utf-8", errors="ignore")
+
+    # Имя папки проекта возьмём из заголовка или из имени md
+    proj_name = md_file.stem.replace("_documentation", "")
+    target_dir = Path(base_out) / proj_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    restore_from_markdown(md_text, target_dir)
+
+    assets = md_file.parent / "assets.zip"
+    if assets.exists():
+        with zipfile.ZipFile(assets, "r") as zf:
+            zf.extractall(target_dir)
+
+    messagebox.showinfo("RepoTool", f"Проект восстановлен в:\n{target_dir}")
+
 def main():
-    # Если запущено из контекстного меню без аргументов — оставляем старую интерактивную логику.
     args = parse_args(sys.argv[1:])
-    if not args.mode or not args.path:
-        # Фолбэк: упрощённый диалог через стандартные окна — оставьте как было у вас.
-        # Чтобы не тянуть внешние GUI-зависимости, сохраняем CLI-режим «по аргументам».
-        print("Использование (CLI):")
-        print("  Генерация: RepoTool.exe --mode generate --path <папка> [--out <file.md>] [--zip-binaries]")
-        print("  Восстановл: RepoTool.exe --mode restore  --path <file.md> [--out <папка>]")
+
+    # 1) CLI-режим (флаги заданы)
+    if args.mode and args.path:
+        base = Path(args.path).resolve()
+        out = Path(args.out).resolve() if args.out else None
+        if args.mode == "generate":
+            generate_mode(base, out, zip_binaries=bool(args.zip_binaries))
+        else:
+            restore_mode(base, out)
         return
 
-    base = Path(args.path).resolve()
-    out = Path(args.out).resolve() if args.out else None
-    if args.mode == "generate":
-        generate_mode(base, out, zip_binaries=args.zip_binaries)
+    # 2) Режим вызова из Проводника: ожидаем ровно один позиционный аргумент (сам Windows передаёт "%1")
+    # PyInstaller --onefile --noconsole передаст argv[1] как путь; parser его не съел (нет позиционных),
+    # поэтому просто посмотрим sys.argv вручную.
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(positional) == 1 and not (args.mode or args.path or args.out):
+        selected = Path(positional[0]).resolve()
+        if selected.is_dir():
+            # Папка -> Генерация (с диалогом «Сохранить как»)
+            run_interactive_with_folder(selected)
+            return
+        if selected.is_file() and selected.suffix.lower() == ".md":
+            # .md -> Восстановление (с диалогом выбора папки)
+            run_interactive_with_md(selected)
+            return
+        # Если сюда дошли — неизвестный тип объекта
+        if messagebox:
+            messagebox.showerror("RepoTool", f"Неподдерживаемый тип объекта:\n{selected}")
+        return
+
+    # 3) Если вообще нет аргументов — дадим подсказку (в интерактиве окно, иначе stdout)
+    help_msg = (
+        "RepoTool — использование:\n\n"
+        "• В Проводнике:\n"
+        "  - ПКМ на папке → «Создать документацию проекта» (откроется диалог «Сохранить как…»)\n"
+        "  - ПКМ на .md → «Восстановить проект из документации» (откроется диалог выбора папки)\n\n"
+        "• CLI:\n"
+        "  RepoTool.exe --mode generate --path <папка> --out <docs.md> [--zip-binaries]\n"
+        "  RepoTool.exe --mode restore  --path <docs.md> --out <папка>\n"
+    )
+    if messagebox:
+        root = tk.Tk(); root.withdraw()
+        messagebox.showinfo("RepoTool — помощь", help_msg)
     else:
-        restore_mode(base, out)
+        print(help_msg)
 
 if __name__ == "__main__":
     main()
